@@ -12,15 +12,20 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 )
 
 // Config 顶层配置。
 type Config struct {
-	Listen    string `json:"listen"`     // ":7863"
-	APIKey    string `json:"api_key"`    // 空 = 不鉴权
-	AuthDir   string `json:"auth_dir"`   // ./auths
-	StateFile string `json:"state_file"` // ./data/state.json
+	Listen string `json:"listen"` // ":7863"
+	// APIKey 主密钥：空 = 不鉴权。不受白名单限制，可访问全部模型（零回归）。
+	APIKey string `json:"api_key"`
+	// Keys 受限密钥列表：每个条目可配白名单，只能访问 Allow 列出的模型。
+	// 主密钥与受限密钥并存；主密钥始终全量放行（见 server.allowedModel）。
+	Keys      []livecfg.APIKeyEntry `json:"keys,omitempty"`
+	AuthDir   string                `json:"auth_dir"`   // ./auths
+	StateFile string                `json:"state_file"` // ./data/state.json
 
 	Panel struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
@@ -153,6 +158,30 @@ type Config struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
 	} `json:"features"`
+
+	// WebAuth 面板账密登录（独立于 api_key 的"人用"凭证）。
+	//
+	// 与 api_key 的关系：api_key 是给 OpenAI 兼容客户端用的机器凭证（客户端只会发
+	// Bearer 头，不会填登录表单），服务于 /v1/*；本段是给浏览器里的人用的，
+	// 启用后面板 /panel/* 只认登录会话（api_key 对面板无效）。
+	//
+	// 缺省 enabled=false：完全不生效（老配置零回归，面板仍走 api_key 弹窗）。
+	WebAuth struct {
+		Enabled bool `json:"enabled"`
+		// UsersFile 用户库落盘路径（用户名 → PBKDF2 哈希）。
+		// 默认 data/web_users.json；独立于 config.json 存放——密码哈希不该出现在
+		// 会被人随手贴出来的配置文件里。
+		UsersFile string `json:"users_file"`
+		// SessionTTL 会话有效期，Go duration 字符串（"12h"）。空 = 12h。
+		SessionTTL string `json:"session_ttl"`
+		// CookieSecure 会话 Cookie 是否带 Secure 标志。HTTPS 部署应设 true；
+		// 纯 HTTP 部署必须 false（否则浏览器不回传 Cookie，登录后立刻又跳登录页）。
+		CookieSecure bool `json:"cookie_secure"`
+		// MaxLoginAttempts / LoginWindow 单 IP 登录失败限速（防在线爆破）。
+		// 缺省 10 次 / 5m；成功登录清零。
+		MaxLoginAttempts int    `json:"max_login_attempts"`
+		LoginWindow      string `json:"login_window"`
+	} `json:"web_auth"`
 
 	Prompt struct {
 		// Mode passthrough（默认）= 透传客户端原始 system（降级重试仍会切到 Degraded）；
@@ -453,6 +482,32 @@ func applyEnv(c *Config) {
 
 func (c *Config) normalize() error {
 	var err error
+	// keys[] 归一：去空白、丢弃 Key 为空的条目、拒绝与主密钥或其他条目重复。
+	// 重复 key 是危险配置（用户以为两个白名单独立，实际后配置的永远匹配不到），
+	// 故 fail fast 而不是静默去重。
+	{
+		seen := map[string]int{}
+		if c.APIKey != "" {
+			seen[c.APIKey] = -1 // 主密钥占位，-1 表示"主密钥"
+		}
+		out := c.Keys[:0]
+		for i, k := range c.Keys {
+			k.Key = strings.TrimSpace(k.Key)
+			k.Name = strings.TrimSpace(k.Name)
+			if k.Key == "" {
+				continue // 允许面板先建占位条目
+			}
+			if prev, dup := seen[k.Key]; dup {
+				if prev == -1 {
+					return fmt.Errorf("keys[%d]: 与主密钥 api_key 重复", i)
+				}
+				return fmt.Errorf("keys[%d]: 与 keys[%d] 重复", i, prev)
+			}
+			seen[k.Key] = i
+			out = append(out, k)
+		}
+		c.Keys = out
+	}
 	if c.Panel.PackageDetailLimit <= 0 {
 		c.Panel.PackageDetailLimit = 5
 	}

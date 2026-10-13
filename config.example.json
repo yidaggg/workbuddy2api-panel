@@ -84,5 +84,20 @@
     "enabled": true,
     "ttl": "30m",
     "gc_interval": "5m"
-  }
+  },
+  "web_auth": {
+    "enabled": false,
+    "users_file": "./data/web_users.json",
+    "session_ttl": "12h",
+    "cookie_secure": false,
+    "max_login_attempts": 10,
+    "login_window": "5m"
+  },
+  "keys": [
+    {
+      "key": "sk-restricted-example",
+      "name": "示例受限密钥",
+      "allow": ["glm-4.6", "global:deepseek-v4.1-flash"]
+    }
+  ]
 }

@@ -29,6 +29,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/webauth"
 )
 
 // Config 面板依赖（main 装配注入）。
@@ -65,6 +66,10 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+
+	// WebAuth 面板账密登录（nil 或未启用 = 仅 api_key，老行为零回归）。
+	// 启用后面板 API 只认登录会话（api_key 对 /panel/* 无效，见 withAuth 注释）。
+	WebAuth *webauth.Auth
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -147,6 +152,22 @@ func New(cfg Config) *Panel {
 func (p *Panel) Logs() *Ring { return p.logs }
 
 func (p *Panel) routes() {
+	// 账密登录（公开端点只有 status/setup/login 三个；其余需登录态，见 web_login.go）。
+	p.mux.HandleFunc("GET /panel/api/auth/status", p.authStatus)
+	// 首次初始化：用户库为空时创建首个管理员。公开端点（此刻还没有会话，
+	// 拿不到 CSRF token），靠"仅空库可用"这一瞬态约束保证安全。见 web_login.go。
+	p.mux.HandleFunc("POST /panel/api/auth/setup", p.authSetup)
+	p.mux.HandleFunc("POST /panel/api/auth/login", p.authLogin)
+	p.mux.HandleFunc("POST /panel/api/auth/logout", p.withAuth(p.authLogout))
+	p.mux.HandleFunc("POST /panel/api/auth/password", p.withAuth(p.authChangePassword))
+	// 改账号（用户名 + 密码一次事务完成）。旧前端分两步调 password+rename 会因
+	// 中途会话失效而失败，此端点为其替代。见 web_login.go 的说明。
+	p.mux.HandleFunc("POST /panel/api/auth/account", p.withAuth(p.authChangeAccount))
+	p.mux.HandleFunc("GET /panel/api/auth/users", p.withAuth(p.authListUsers))
+	p.mux.HandleFunc("POST /panel/api/auth/users", p.withAuth(p.authUpsertUser))
+	p.mux.HandleFunc("DELETE /panel/api/auth/users/{name}", p.withAuth(p.authDeleteUser))
+	p.mux.HandleFunc("POST /panel/api/auth/users/{name}/rename", p.withAuth(p.authRenameUser))
+
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
@@ -200,6 +221,21 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // 即用新值（无需重启）。
 func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if p.cfg.WebAuth.Enabled() {
+			// 账密模式：只认会话 Cookie（Bearer 一律拒绝）。
+			if _, ok := p.cfg.WebAuth.Valid(r); !ok {
+				writeErr(w, http.StatusUnauthorized, "not_logged_in")
+				return
+			}
+			// 改状态请求需过 CSRF 双提交校验（见 csrf.go）。
+			if !checkCSRF(r) {
+				writeErr(w, http.StatusForbidden, "csrf token missing or mismatched")
+				return
+			}
+			next(w, r)
+			return
+		}
+		// 旧模式：Bearer api_key（api_key 为空时放行，保持既有语义）。
 		if !httpauth.VerifyBearer(r, p.apiKey()) {
 			writeErr(w, http.StatusUnauthorized, "invalid_api_key")
 			return
@@ -376,7 +412,7 @@ func panelModelEntry(realm string, mi upstream.ModelInfo, remoteEfforts []string
 		"can_disable_thinking": mi.CanDisableThinking,
 		"supports_reasoning":   mi.SupportsReasoning,
 		"supports_images":      mi.SupportsImages,
-		"credits":              mi.Credits,
+		"credits":              upstream.NormalizeCredits(mi.Credits),
 		"description":          mi.Description,
 		"tags":                 mi.Tags,
 		"vendor":               mi.Vendor,

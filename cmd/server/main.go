@@ -28,6 +28,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/webauth"
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
@@ -50,6 +51,12 @@ func stateSibling(stateFile, name string) string {
 func main() {
 	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
 	flag.Parse()
+
+	// 子命令分派：setpassword 是面板账密登录的**引导入口**（首个用户 / 忘记密码时
+	// 从宿主机侧操作用户库）。必须在 Load/自动生成配置之前判断，避免子命令被主流程吞掉。
+	if args := flag.Args(); len(args) > 0 && args[0] == "setpassword" {
+		os.Exit(runSetPassword(*cfgPath, args[1:]))
+	}
 
 	cfg, err := Load(*cfgPath)
 	if err != nil {
@@ -234,6 +241,7 @@ func main() {
 	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
 	live := livecfg.New(livecfg.Snapshot{
 		APIKey:               cfg.APIKey,
+		Keys:                 cfg.Keys,
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
@@ -262,6 +270,28 @@ func main() {
 		log.Printf("[reqlog] 请求指标已启用；JSONL 归档已关闭")
 	}
 
+	// 面板账密登录（web_auth）：默认关闭。开启后面板只认登录会话，
+	// api_key 仅服务 /v1/*（两套完全隔离）。
+	webAuth, err := webauth.New(webauth.Config{
+		Enabled:          cfg.WebAuth.Enabled,
+		UsersFile:        cfg.WebAuth.UsersFile,
+		SessionTTL:       cfg.WebAuth.SessionTTL,
+		CookieSecure:     cfg.WebAuth.CookieSecure,
+		MaxLoginAttempts: cfg.WebAuth.MaxLoginAttempts,
+		LoginWindow:      cfg.WebAuth.LoginWindow,
+	})
+	if err != nil {
+		log.Fatalf("web_auth: %v", err)
+	}
+	if webAuth.Enabled() {
+		if !webAuth.HasUsers() {
+			log.Printf("⚠️  web_auth 已启用但没有任何用户——面板将无法登录！"+
+				"请先执行：%s setpassword <用户名>   （或在 config.json 里关掉 web_auth.enabled）", os.Args[0])
+		} else {
+			log.Printf("web_auth 账密登录已启用（%d 个用户，会话 %s）", len(webAuth.Usernames()), cfg.WebAuth.SessionTTL)
+		}
+	}
+
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
@@ -274,6 +304,7 @@ func main() {
 		StickyCount: sessCount,
 		Version:     appVersion,
 		Live:        live,
+		WebAuth:     webAuth,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
@@ -481,6 +512,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
 	live.Store(livecfg.Snapshot{
 		APIKey:               newCfg.APIKey,
+		Keys:                 newCfg.Keys,
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,

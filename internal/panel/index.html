@@ -323,6 +323,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 /* ── 弹层 ─────────────────────────────────────────────────────────── */
 .veil { position: fixed; inset: 0; background: rgba(6,8,13,.62); backdrop-filter: blur(2px); display: none; z-index: 60; }
 .veil.on { display: flex; align-items: center; justify-content: center; padding: 20px; }
+/* 伪密码框：用 type="text" 避开浏览器自动填充（详见登录框处的长注释），
+   靠 -webkit-text-security 显示为圆点。 */
+input.secret { -webkit-text-security: disc; text-security: disc; }
+/* 登录/密钥门是"全屏独占"：不透明背景 + 更高的 z-index。
+   半透明的普通弹窗（.veil）叠在面板之上没问题，但登录门之下**不能有任何东西**——
+   面板骨架在未登录时已 hidden，这里再把背景做成不透明，双保险确保
+   登录前看不到任何界面（也避免深色半透明下隐约透出侧栏轮廓）。 */
+.veil.lock { background: var(--bg); backdrop-filter: none; z-index: 80; }
 .dlg {
   background: var(--surface); border: 1px solid var(--line); border-radius: 13px;
   width: 560px; max-width: 100%; max-height: 86vh; display: flex; flex-direction: column;
@@ -589,6 +597,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 </style>
 </head>
 <body>
+<!-- 面板骨架：账密模式下未登录时保持 hidden（登录门在 appShell 之外，
+   见文件末尾 gate()）。默认 hidden 由 JS 决定何时显示。 -->
+<div id="appShell" hidden>
 <div class="shell">
   <nav class="nav">
     <div class="brand">
@@ -630,9 +641,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <span class="sep">/</span>
       <span class="meta" id="subMeta">-</span>
       <div class="grow"></div>
+      <span class="note" id="meName"></span>
       <button class="icon ghost" id="btnTheme" title="切换明暗（跟随系统 → 浅色 → 深色）" aria-label="切换主题">
         <svg id="icoTheme" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg>
       </button>
+      <button id="btnPwd" hidden title="修改当前登录账号的密码">改密</button>
+      <button id="btnLogout" hidden title="退出登录">退出</button>
       <button id="btnRefresh">刷新</button>
       <button class="primary" id="btnAdd">添加账号</button>
     </div>
@@ -1146,6 +1160,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     </section>
   </div>
 </div>
+</div>
 
 <!-- 积分任务 -->
 <div class="veil" id="taskVeil">
@@ -1234,6 +1249,83 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <button id="btnCopyUrl" hidden>复制链接</button>
       <button id="btnOpenUrl" class="primary" hidden>在浏览器打开</button>
       <button id="btnCloseAdd">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 登录（账密模式） -->
+<div class="veil lock" id="loginVeil">
+  <div class="dlg" style="width:420px">
+    <header>
+      <h3 id="loginTitle">登录</h3>
+      <div class="hint" id="loginHint">请输入面板账号与密码。</div>
+    </header>
+    <div class="body">
+      <!-- ⚠ 为什么密码框不用 type="password"（踩了很深的坑，别改回去）：
+           用 type="password" 时，浏览器/系统密码管理器会把它识别为密码字段并介入，
+           在手机上表现为「在密码框输入时，焦点被自动跳到账号框」。
+           试过的手段与结果：
+             - autocomplete="username/current-password" → 加剧问题
+             - autocomplete="off"                       → Chrome 对登录表单刻意忽略，无效
+             - 运行时 focusin 抢回焦点                   → 与手指操作打架，更糟
+           最终方案：改用 type="text" 伪装成普通输入框，浏览器不再视其为密码字段，
+           自然不再介入。视觉上靠 CSS 的 -webkit-text-security: disc 显示为圆点，
+           逻辑上仍是普通文本，后端接口不受影响（本来收的就是 form 里的明文）。
+           安全性：不走 type="password" 不改变传输安全（HTTPS 才是关键），
+           仅少了浏览器自带的"复制提示"，故补 spellcheck/autocorrect 等关闭项。
+           兼容：-webkit-text-security 在 Chrome/Safari/微信 WebView 均支持；
+           不支持的老浏览器会显示明文，此时用 JS 兜底加 letter-spacing 属性无效，
+           故保留 type 切换能力（见 app.js 的 applySecretMask）。 -->
+      <input type="text" id="loginUser" placeholder="用户名" autocomplete="off"
+             autocapitalize="off" autocorrect="off" spellcheck="false"
+             name="panel-user" style="margin-bottom:8px">
+      <input type="text" id="loginPass" class="secret" placeholder="密码" autocomplete="off"
+             autocapitalize="off" autocorrect="off" spellcheck="false"
+             name="panel-pass">
+      <!-- 首次初始化专用：确认密码。平时隐藏。 -->
+      <input type="text" id="loginPass2" class="secret" placeholder="再次输入密码" autocomplete="off"
+             autocapitalize="off" autocorrect="off" spellcheck="false"
+             name="panel-pass2" style="margin-top:8px" hidden>
+      <div class="state err" id="loginErr" hidden style="margin-top:10px"></div>
+    </div>
+    <footer>
+      <span class="grow"></span>
+      <button class="primary" id="btnLogin">登录</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 修改密码 -->
+<div class="veil" id="pwdVeil">
+  <div class="dlg" style="width:420px">
+    <header>
+      <h3>账号设置</h3>
+      <div class="hint">改用户名或密码后，所有登录会话将失效，需要用新凭据重新登录。</div>
+    </header>
+    <div class="body">
+      <label class="fld">
+        <span class="lb">用户名</span>
+        <input type="text" id="pwdUser" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+      </label>
+      <label class="fld">
+        <span class="lb">当前密码</span>
+        <input type="password" id="pwdOld" autocomplete="off">
+        <span class="hint">仅修改用户名时也必须填写（用于确认身份）</span>
+      </label>
+      <label class="fld">
+        <span class="lb">新密码</span>
+        <input type="password" id="pwdNew" autocomplete="off" placeholder="留空 = 不修改密码">
+      </label>
+      <label class="fld">
+        <span class="lb">确认新密码</span>
+        <input type="password" id="pwdNew2" autocomplete="off" placeholder="留空 = 不修改密码">
+      </label>
+      <div class="state err" id="pwdErr" hidden></div>
+    </div>
+    <footer>
+      <span class="grow"></span>
+      <button id="btnPwdCancel">取消</button>
+      <button class="primary" id="btnPwdSave">保存</button>
     </footer>
   </div>
 </div>
