@@ -495,6 +495,7 @@ func (s *Scheduler) RunCheckinNow() {
 		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
 	}
 	s.RunStreakBonusNow()
+	s.RunSchoolNow() // 开学季活动（活动期 9/13-9/24，结束自动跳过）
 }
 
 // RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。

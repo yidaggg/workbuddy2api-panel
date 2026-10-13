@@ -598,7 +598,7 @@ function go(v) {
   // 到期提醒卡片：默认可见，进页面即用 overview 快照渲染（零上游请求，随首页统计
   // 每轮刷新）。不再「打开账号池就打上游」——逐账号实时查在账号多时会卡死面板。
   // 完整逐包明细由卡片上的「检查」按钮显式触发（loadPackages/loadExpiry）。
-  if (v === 'taskscenter') reattachQueueView();
+  if (v === 'taskscenter') { reattachQueueView(); loadSchoolStatus(true); }
 }
 
 /* 启动顺序见文件末尾：gate() → enterPanel()。
@@ -1458,7 +1458,7 @@ $('btnRefresh').onclick = async () => {
 function refreshVisible() {
   if (view === 'accounts') loadOverview(true);
   else if (view === 'logs') loadLogs();
-  else if (view === 'taskscenter') reattachQueueView();
+  else if (view === 'taskscenter') { reattachQueueView(); loadSchoolStatus(true); }
 }
 function start() {
   loadOverview(true);
@@ -1657,6 +1657,59 @@ const SCHOOL_TITLES = {
   chat_3_times: '和 AI 对话 3 次 +50c', expert_use: '召唤开学季专家 +50c',
   task_student_verify: '学生认证 +100c（需真实认证，不做）',
 };
+
+/* ── 开学季独立视图（移植自 qiaoba223 fork）──────────────────────── */
+// SCHOOL_META 仅是「任务列顺序 + 表头短名」的展示口径；SCHOOL_TITLES /
+// staskHTML / LUCK_SVG 复用上方已有定义（成长任务队列也在用，勿重复声明）。
+const SCHOOL_META = [
+  ['share_invite', '分享'],
+  ['desktop_chat_1_time', '桌面'],
+  ['chat_3_times', '对话×3'],
+  ['expert_use', '专家'],
+  ['task_student_verify', '认证'],
+];
+
+async function loadSchoolStatus(quiet) {
+  const st = $('schoolState'), list = $('schoolList');
+  if (!st || !list) return;
+  if (!quiet) { st.hidden = false; st.className = 'state'; st.innerHTML = '<span class="dots">查询中</span>'; list.innerHTML = ''; }
+  try {
+    const d = await api('school/status');
+    const arr = d.accounts || [];
+    if (!arr.length) {
+      st.hidden = false; st.className = 'state'; st.textContent = '暂无可用账号';
+      list.innerHTML = ''; return;
+    }
+    let allDone = 0;
+    const head = '<div class="shead"><div class="who">账号</div><div class="stasks">' +
+      SCHOOL_META.map(([, name]) => '<span>' + esc(name) + '</span>').join('') +
+      '</div><div class="luck">剩余抽奖</div></div>';
+    // 外层滚动壳：表头 + 数据行一起横向平移（窄屏表宽超出视口）。
+    list.innerHTML = '<div class="swrap-scroll"><div class="swrap-table">' + head + arr.map(v => {
+      const by = {};
+      (v.tasks || []).forEach(t => by[t.task_code] = t);
+      const cells = SCHOOL_META.map(([code]) => {
+        const t = by[code];
+        const html = code === 'task_student_verify'
+          ? '<span class="stask todo"><span class="mark">—</span>不做</span>'
+          : staskHTML(t);
+        return '<span title="' + esc(SCHOOL_TITLES[code] || code) + '">' + html + '</span>';
+      }).join('');
+      const done = SCHOOL_META.filter(([code]) => code !== 'task_student_verify' && by[code] && by[code].status === 'claimed').length;
+      allDone += done === 4 ? 1 : 0;
+      return '<div class="srow">' +
+        '<div class="who"><div class="nm" title="' + esc(v.nickname || '') + '">' + esc(v.nickname || '未命名') + '</div><div class="id">' + esc(v.uid) + '</div></div>' +
+        '<div class="stasks">' + cells + '</div>' +
+        '<div class="luck" title="剩余抽奖次数">' + LUCK_SVG + (v.chances == null ? '—' : v.chances) + '</div>' +
+        (v.error ? '<div class="err">' + esc(v.error) + '</div>' : '') +
+        '</div>';
+    }).join('') + '</div></div>';
+    $('schoolSummary').textContent = allDone === arr.length ? '今日全部完成 🎉' : allDone + '/' + arr.length + ' 个账号今日全部完成';
+    st.hidden = true;
+  } catch (e) {
+    st.hidden = false; st.className = 'state err'; st.textContent = e.message;
+  }
+}
 
 /* ── 精简 QR 编码器（券码二维码用）────────────────────────────────────
    规格子集：byte 模式、ECC L、版本 1-5（全部单纠错块，免块交织）、固定掩码 0。
@@ -1889,6 +1942,17 @@ async function loadSchoolVouchers() {
   }
 }
 $('btnSchoolVouchers').onclick = loadSchoolVouchers;
+if ($('btnSchoolRefresh')) $('btnSchoolRefresh').onclick = () => loadSchoolStatus(false);
+if ($('btnSchoolRunAll')) {
+  $('btnSchoolRunAll').onclick = async () => {
+    if (!confirm('将对全部账号执行开学季闭环（分享/桌面/对话/专家 + 抽奖）。\n注意：活动期已结束（09-13 ~ 09-24），执行会直接跳过。确认继续？')) return;
+    try {
+      await api('school/run_all', { method: 'POST' });
+      toast('开学季闭环已开始，结果看任务日志', 'ok');
+      setTimeout(() => loadSchoolStatus(true), 15000);
+    } catch (e) { toast(e.message, 'err'); }
+  };
+}
 $('btnVcClose').onclick = () => $('vcVeil').classList.remove('on');
 $('btnVcRefresh').onclick = loadSchoolVouchers;
 
@@ -3221,17 +3285,26 @@ const ApiKeyEditor = (() => {
 
   // 从后端拉全量模型（规范键，保留 cn:/global: 前缀，白名单提交的就是这个形式）。
   // 失败时退化：只用已有白名单 + 手工添加，不阻塞编辑。
+  //
+  // 两趟：先 all=1 逐账号汇总（某模型只在第 3 个账号上时也能列出，移植自 qiaoba223
+  // fork 的 models?all=1），失败再退到默认口径（每域仅首个账号）。
   async function ensureModels() {
     if (models) return models;
     const out = new Set();
-    try {
-      const d = await api('models');
-      for (const m of (d.data || d.models || [])) {
-        const id = String(m.id || m.name || '');
-        if (!id) continue;
-        out.add(canon(id));            // 保留 realm：'global:xxx' 不被剥掉
+    const take = (arr) => {
+      for (const m of (arr || [])) {
+        const id = String(m.id || m.name || m || '');
+        if (id) out.add(canon(id));   // 保留 realm：'global:xxx' 不被剥掉
       }
-    } catch (e) { /* 无账号池时端点可能 503，退化为手工添加 */ }
+    };
+    try {
+      const d = await api('models?all=1');
+      // all=1 的分组契约：{ok, cn:[...], global:[...]}，不去重（重复无害，Set 会归并）。
+      if (d && (d.cn || d.global)) { take(d.cn); take(d.global); }
+      else take(d.data || d.models);
+    } catch (e) {
+      try { const d = await api('models'); take(d.data || d.models); } catch (e2) { /* 无账号池时端点可能 503，退化为手工添加 */ }
+    }
     models = Array.from(out).sort();
     return models;
   }

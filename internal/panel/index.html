@@ -112,12 +112,28 @@ body {
 .qdot.skip { background: var(--ink-3); }
 @keyframes qpulse { 50% { opacity: .35; } }
 @media (prefers-reduced-motion: reduce) { .qdot.run { animation: none; } }
-.srow { display: grid; grid-template-columns: minmax(150px, 210px) 1fr auto; gap: 14px; align-items: center; padding: 13px 16px; }
+.swrap { position: relative; }
+/* 开学季宽表滚动壳（移植自 qiaoba223 3f69302）：窄屏下 5 个任务列被压到
+   ~44px 且无处可滑（表现为"开学季表滑不动"）。外层滚动，表头与数据行
+   一起平移保证对齐。touch-action 必须为 auto 而非 pan-x，否则纵向滑不动页面。 */
+.swrap-scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  touch-action: auto;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  margin: 0 -16px;
+  padding: 0 16px;
+}
+.swrap-scroll::-webkit-scrollbar { display: none; }
+.swrap-table { width: max-content; min-width: 100%; }
+.srow { display: grid; grid-template-columns: minmax(150px, 210px) minmax(340px, 1fr) auto; gap: 14px; align-items: center; padding: 13px 16px; }
 .srow + .srow { border-top: 1px solid var(--line-soft); }
 .srow .who .nm { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .srow .who .id { font: 10.5px var(--mono); color: var(--ink-3); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .shead {
-  display: grid; grid-template-columns: minmax(150px, 210px) 1fr auto;
+  display: grid; grid-template-columns: minmax(150px, 210px) minmax(340px, 1fr) auto;
   gap: 14px; align-items: center; padding: 9px 16px 7px;
   font-size: 11.5px; color: var(--ink-3); border-bottom: 1px solid var(--line-soft);
 }
@@ -752,6 +768,21 @@ input.secret { -webkit-text-security: disc; text-security: disc; }
 
     <!-- 任务中心 -->
     <section class="view" id="view-taskscenter" hidden>
+      <div class="box">
+        <header>
+          <h3>开学季 <span class="hint">09-13 ~ 09-24 · 每日重置 · 活动已结束，历史状态仍可查</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="schoolSummary"></span>
+          <button class="xs" id="btnSchoolVouchers" title="开学季抽奖抽中的第三方券码（活动已结束，历史券码仍可查）">查询券码</button>
+          <button class="xs" id="btnSchoolRefresh">刷新</button>
+          <button class="xs primary" id="btnSchoolRunAll" title="活动已结束，执行将直接跳过（in_period=false）">全部账号执行闭环</button>
+        </header>
+        <div class="state" id="schoolState"><span class="dots">加载中</span></div>
+        <div class="swrap">
+          <div id="schoolList"></div>
+        </div>
+      </div>
+
       <div class="box">
         <header>
           <h3>成长任务队列 <span class="hint" id="qcSummary"></span></h3>

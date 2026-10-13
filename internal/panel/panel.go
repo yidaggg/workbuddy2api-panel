@@ -196,6 +196,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/tasks/run_queue", p.withAuth(p.tasksRunQueue))
 	p.mux.HandleFunc("GET /panel/api/tasks/queue", p.withAuth(p.tasksQueueStatus))
 	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))
+	p.mux.HandleFunc("GET /panel/api/school/status", p.withAuth(p.schoolStatus))
+	p.mux.HandleFunc("POST /panel/api/school/run_all", p.withAuth(p.schoolRunAll))
 	p.mux.HandleFunc("POST /panel/api/checkin_all", p.withAuth(p.checkinAll))
 	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAuth(p.travelAll))
 	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAuth(p.activityAll))
@@ -355,17 +357,36 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0)
 	var fetchErrs []string
+	q := r.URL.Query()
+	// all=1：逐账号探测并汇总，按 realm 分组、**不去重**（同名模型在多账号间重复
+	// 出现属预期，便于看清"哪个账号有哪些模型"）。移植自 qiaoba223 fork。
+	// 默认（无参数）：每域只探首个账号，保持零回归。
+	// realm=global：只输出 global 域（前端默认模式要分开取 cn/global 两份）。
+	all := q.Get("all") == "1"
+	onlyRealm := q.Get("realm")
+
+	cnOut := make([]map[string]any, 0)
+	glOut := make([]map[string]any, 0)
 
 	// CN 域：有可用 CN 账号才查（此前无条件 Pool.Pick()+FetchModels——选中 global
 	// 账号时打 CN 端点必然失败，混合池表现为偶发 502，纯 global 池必炸）。
-	if uids := p.cfg.Pool.AvailableUIDsForRealm("cn"); len(uids) > 0 {
-		if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
-			infos, err := p.cfg.Upstream.FetchModels(acct)
-			if err != nil {
-				fetchErrs = append(fetchErrs, "cn: "+err.Error())
-			} else {
+	if onlyRealm == "" || onlyRealm == "cn" {
+		if uids := p.cfg.Pool.AvailableUIDsForRealm("cn"); len(uids) > 0 {
+			if !all {
+				uids = uids[:1]
+			}
+			for _, uid := range uids {
+				acct := p.cfg.Pool.AuthByUID(uid)
+				if acct == nil {
+					continue
+				}
+				infos, err := p.cfg.Upstream.FetchModels(acct)
+				if err != nil {
+					fetchErrs = append(fetchErrs, "cn: "+err.Error())
+					continue
+				}
 				for _, mi := range infos {
-					out = append(out, panelModelEntry("cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
+					cnOut = append(cnOut, panelModelEntry("cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
 				}
 			}
 		}
@@ -373,21 +394,54 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 
 	// global 域：路由开关开且有可用 global 账号才查（独立目录端点，FetchGlobalModelInfos；
 	// Upstream.GlobalEnabled 是探测侧同一道闸，与 main 装配的 config global.enabled 一致）。
-	if p.cfg.Upstream.GlobalEnabled {
+	if p.cfg.Upstream.GlobalEnabled && (onlyRealm == "" || onlyRealm == "global") {
 		if uids := p.cfg.Pool.AvailableUIDsForRealm("global"); len(uids) > 0 {
-			if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
+			if !all {
+				uids = uids[:1]
+			}
+			efforts, defaults := p.cfg.Upstream.GlobalEffortSnapshot()
+			for _, uid := range uids {
+				acct := p.cfg.Pool.AuthByUID(uid)
+				if acct == nil {
+					continue
+				}
 				infos := p.cfg.Upstream.FetchGlobalModelInfos(acct)
 				if len(infos) == 0 {
 					fetchErrs = append(fetchErrs, "global: 上游未返回可用模型")
-				} else {
-					efforts, defaults := p.cfg.Upstream.GlobalEffortSnapshot()
-					for _, mi := range infos {
-						out = append(out, panelModelEntry("global", mi, efforts[mi.ID], defaults[mi.ID], p.cfg.Upstream.HTTP))
-					}
+					continue
+				}
+				for _, mi := range infos {
+					glOut = append(glOut, panelModelEntry("global", mi, efforts[mi.ID], defaults[mi.ID], p.cfg.Upstream.HTTP))
 				}
 			}
 		}
 	}
+
+	// all=1 走 ref 的分组契约 {ok, cn[], global[]}（前端据此分 tab，且不去重）。
+	if all {
+		resp := map[string]any{"ok": true, "cn": cnOut, "global": glOut}
+		if len(fetchErrs) > 0 {
+			resp["errors"] = fetchErrs
+		}
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+
+	// realm=global 只回 global；默认回 cn+global 合并（前端默认模式两次调用分别取）。
+	if onlyRealm == "global" {
+		if len(glOut) == 0 {
+			if len(fetchErrs) > 0 {
+				writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(fetchErrs, "; "))
+				return
+			}
+			writeErr(w, http.StatusServiceUnavailable, "没有可用 global 账号：请先在面板添加账号再查询")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": glOut})
+		return
+	}
+	out = append(out, cnOut...)
+	out = append(out, glOut...)
 
 	if len(out) == 0 {
 		if len(fetchErrs) > 0 {

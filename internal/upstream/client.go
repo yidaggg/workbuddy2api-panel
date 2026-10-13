@@ -1316,9 +1316,43 @@ func mergeModelInfos(primary, secondary []ModelInfo) []ModelInfo {
 
 // fetchEnterpriseModels 单路探测企业模型端点（/console/enterprises/personal/models）。
 // 解析口径：agents[cli].models 过滤 + nonChatModel 剔除 + disabled 剔除。
+// enterpriseModelsProbePaths 企业模型端点候选路径（按序探测，首个成功即返回）。
+// CN 现状路在前保持零回归；global 域 /console 恒 500，故由 globalOn 把 /v2 前移。
+var enterpriseModelsProbePaths = []string{
+	"/console/enterprises/personal/models",
+	"/v2/enterprises/personal/models",
+}
+
+// fetchEnterpriseModels 探测企业模型端点：按候选路径族依次尝试，首个成功即返回。
+// 移植自 qiaoba223 fork：此前单路打 /console，global 域恒 500 导致整路失败。
 func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
+	paths := enterpriseModelsProbePaths
+	if c.globalOn(a) {
+		// global 域：/console 恒 500，/v2 才是可用路（顺序前移，省一次无效请求）。
+		paths = []string{
+			"/v2/enterprises/personal/models",
+			"/console/enterprises/personal/models",
+		}
+	}
+	var lastErr error
+	for _, path := range paths {
+		out, err := c.fetchEnterpriseModelsAt(a, path)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return out, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("models api: no probe path")
+	}
+	return nil, lastErr
+}
+
+// fetchEnterpriseModelsAt 探测单个企业模型端点路径。
+func (c *Client) fetchEnterpriseModelsAt(a *auth.Auth, path string) ([]ModelInfo, error) {
 	// 局部变量名避开 url（本包已 import net/url，同名会造成阅读混淆）。
-	endpoint := c.chatBase(a) + "/console/enterprises/personal/models"
+	endpoint := c.chatBase(a) + path
 	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -1362,9 +1396,6 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 			break
 		}
 	}
-	if len(cliIDs) == 0 {
-		return nil, fmt.Errorf("no cli agent models found")
-	}
 	// dynMap 收集模型字段；nonChatModel 过滤在写入 dynMap 前执行，
 	// 确保非对话条目（nes-/completion-/codewise- 前缀、maxOutputTokens≤256、
 	// tags 含 text-to-image）根本不进返回列表（来源：harness buddy.ts:547-555）。
@@ -1375,11 +1406,32 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 		}
 		dynMap[m.ID] = m
 	}
-	out := make([]ModelInfo, 0, len(cliIDs))
+	// agents[cli] 优先：登在 cli 面下的模型排在前、保持既有顺序（零回归）。
+	out := make([]ModelInfo, 0, len(dynMap))
+	seen := make(map[string]bool, len(dynMap))
 	for _, id := range cliIDs {
+		if seen[id] {
+			continue
+		}
 		if m, ok := dynMap[id]; ok && !m.Disabled {
+			seen[id] = true
 			out = append(out, m.modelInfo())
 		}
+	}
+	// 兜底补齐 dynMap 中未登在 cli 面、但上游确实下发的对话模型
+	// （如 CN /console 的 deepseek-v4-pro / kimi-k2.5 / hunyuan-* 等）。
+	// 早期实现只输出 cliIDs 交集，导致这些"上游有、cli 表没有"的模型被静默吞掉，
+	// 客户端在 /v1/models 里看不到。与 /v3/config 全量口径对齐。
+	// 顺序稳定：按 env.Data.Models 原序追加，不依赖 map 迭代序。
+	for _, m := range env.Data.Models {
+		if seen[m.ID] || m.Disabled {
+			continue
+		}
+		if _, ok := dynMap[m.ID]; !ok {
+			continue
+		}
+		seen[m.ID] = true
+		out = append(out, m.modelInfo())
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")

@@ -32,6 +32,30 @@ type scanAccountItem struct {
 	Nickname  string          `json:"nickname"`
 	Growth    []upstream.Task `json:"growth,omitempty"`
 	GrowthErr string          `json:"growth_error,omitempty"`
+	School    []schoolTaskView `json:"school,omitempty"`
+	SchoolErr string           `json:"school_error,omitempty"`
+	InPeriod  bool             `json:"in_period"`
+}
+
+// schoolTaskView 开学季任务条目（面板展示口径）。
+// 移植自 qiaoba223 fork。
+type schoolTaskView struct {
+	Code   string `json:"task_code"`
+	Status string `json:"status"` // pending | in_progress | completed | claimed
+	Prog   int    `json:"progress"`
+	Target int    `json:"target_count"`
+}
+
+// schoolPending 开学季任务是否待办（排除学生认证——需人工上传学信网截图，纯 API 不可为）。
+func schoolPending(t upstream.SchoolTask) bool {
+	if t.TaskCode == "student_verify" {
+		return false
+	}
+	switch t.Status {
+	case "completed", "claimed":
+		return false
+	}
+	return true
 }
 
 // growthPending 任务是否"未完成且可自动化"。
@@ -102,6 +126,20 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 				for _, t := range mpTasks {
 					if growthPending(t) && !seen[t.TaskCode] {
 						it.Growth = append(it.Growth, t)
+					}
+				}
+			}
+			// 开学季任务（school 域，独立于 growth）：活动期外 in_period=false，
+			// 任务列表亦为空，故零影响。失败静默（旧上游无此端点时不影响扫描）。
+			if stasks, inPeriod, err := p.cfg.Upstream.SchoolTasks(a); err != nil {
+				it.SchoolErr = err.Error()
+			} else {
+				it.InPeriod = inPeriod
+				for _, t := range stasks {
+					if schoolPending(t) {
+						it.School = append(it.School, schoolTaskView{
+							Code: t.TaskCode, Status: t.Status, Prog: t.Progress, Target: t.TargetCount,
+						})
 					}
 				}
 			}
@@ -527,4 +565,96 @@ func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": res})
+}
+
+// ---------------------------------------------------------------------------
+// 开学季独立视图（移植自 qiaoba223 fork）
+// ---------------------------------------------------------------------------
+
+// schoolStatus 全账号开学季任务状态（含抽奖余额）。
+func (p *Panel) schoolStatus(w http.ResponseWriter, r *http.Request) {
+	states := p.cfg.Pool.List()
+	type acctView struct {
+		UID      string           `json:"uid"`
+		Nickname string           `json:"nickname"`
+		InPeriod bool             `json:"in_period"`
+		Tasks    []schoolTaskView `json:"tasks"`
+		Chances  int              `json:"chances"`
+		Err      string           `json:"error,omitempty"`
+	}
+	out := make([]acctView, 0, len(states))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for _, st := range states {
+		if st.Disabled {
+			continue
+		}
+		a := p.cfg.Pool.AuthByUID(st.UID)
+		if a == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(a *auth.Auth) {
+			defer wg.Done()
+			v := acctView{UID: a.UID, Nickname: a.Nickname}
+			// D4 门控：global 账号无开学季活动，不发起任何上游调用。
+			if a.IsGlobal() {
+				v.Err = "global realm（无开学季活动）"
+				mu.Lock()
+				out = append(out, v)
+				mu.Unlock()
+				return
+			}
+			tasks, inPeriod, err := p.cfg.Upstream.SchoolTasks(a)
+			if err != nil {
+				v.Err = err.Error()
+			} else {
+				v.InPeriod = inPeriod
+				for _, t := range tasks {
+					v.Tasks = append(v.Tasks, schoolTaskView{
+						Code: t.TaskCode, Status: t.Status, Prog: t.Progress, Target: t.TargetCount,
+					})
+				}
+			}
+			v.Chances, _ = p.cfg.Upstream.SchoolChances(a)
+			mu.Lock()
+			out = append(out, v)
+			mu.Unlock()
+		}(a)
+	}
+	wg.Wait()
+	sort.Slice(out, func(i, j int) bool { return out[i].Nickname < out[j].Nickname })
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": out})
+}
+
+// schoolRunAll 一键执行全部账号开学季闭环（异步，进度看任务频道日志）。
+func (p *Panel) schoolRunAll(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Scheduler == nil {
+		writeErr(w, http.StatusNotImplemented, "scheduler not available")
+		return
+	}
+	go p.cfg.Scheduler.RunSchoolNow()
+	log.Printf("panel: 开学季全账号闭环已触发")
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+}
+
+// runSchoolQueued 单账号开学季闭环（scheduler 四任务 + 抽奖）。
+func (p *Panel) runSchoolQueued(a *auth.Auth) (string, error) {
+	if p.cfg.Scheduler == nil {
+		return "", fmt.Errorf("scheduler 不可用")
+	}
+	p.cfg.Scheduler.RunSchoolAccountNow(a)
+	// 闭环后回读开学季状态做汇总。
+	tasks, _, err := p.cfg.Upstream.SchoolTasks(a)
+	if err != nil {
+		return "闭环已执行（状态回读失败）", nil
+	}
+	done := 0
+	for _, t := range tasks {
+		if t.Status == "claimed" || t.Status == "completed" {
+			done++
+		}
+	}
+	log.Printf("panel: 队列 school uid=%s: 闭环完成（%d/%d 项完成）", a.UID, done, len(tasks))
+	return fmt.Sprintf("开学季闭环完成（%d/%d 项已完成，抽奖已抽完）", done, len(tasks)), nil
 }
