@@ -3242,11 +3242,14 @@ const ApiKeyEditor = (() => {
     for (const c of draft.allowChips) set.add(canon(c));
     let arr = Array.from(set).filter(k => realmOf(k) === realm);
     if (filter) {
+      // 搜索基于「规范键」（始终带 realm 前缀），与列表展示、勾选值、白名单存储
+      // 三者一致。否则用户搜 "global:" 匹配不到任何项（旧实现按裸名匹配）。
       const f = filter.toLowerCase();
-      arr = arr.filter(k => bare(k).toLowerCase().includes(f));
+      arr = arr.filter(k => k.toLowerCase().includes(f));
     }
     arr.sort();
-    // 返回规范键；渲染时用 bare() 显示、canon() 回写，避免同域名跨域歧义。
+    // 返回规范键；列表展示也用规范键（见 renderCard），
+    // 保证默认模式与「加载所有账号模型」两种来源显示一致。
     return arr;
   }
 
@@ -3313,7 +3316,10 @@ const ApiKeyEditor = (() => {
     let filter = d._filter || '';
     const search = el('input', { type: 'text', class: 'ksearch', placeholder: '搜索模型…', value: filter });
     // 只重画模型列表，不整卡重绘 —— 否则每敲一个字符搜索框都会失焦。
-    search.oninput = () => { d._filter = search.value; renderModelsOnly(box, d, realm); };
+    // 注意：必须传 d._realm 而非闭包捕获的 realm —— 用户切 tab 后 d._realm 已变，
+    // 而 realm 是本卡片构建时的快照，用它重画会把列表拉回旧 realm（表现为
+    // "在国际 tab 搜 global: 搜不到" / "切 tab 后搜索串台"）。
+    search.oninput = () => { d._filter = search.value; renderModelsOnly(box, d, d._realm || 'cn'); };
     box.append(search);
 
     const mlist = el('div', { class: 'kmodels' });
@@ -3326,7 +3332,9 @@ const ApiKeyEditor = (() => {
         cb.checked = d.sel.has(k);
         cb.onchange = () => { cb.checked ? d.sel.add(k) : d.sel.delete(k); syncChips(d); renderChipsOnly(box, d); };
         const lab = el('label');
-        lab.append(cb, el('span', { text: bare(k) }));
+        // 显示规范键（带 realm 前缀）：默认模式后端可能返回裸名、
+        // all=1 模式返回带前缀，统一后同一模型只有一种显示，且可直接搜 "global:"。
+        lab.append(cb, el('span', { text: k }));
         if (d.manual && !(models || []).includes(k)) lab.append(el('i', { class: 'kmanual', text: '手工' }));
         mlist.append(lab);
       }
@@ -3389,7 +3397,8 @@ const ApiKeyEditor = (() => {
       cb.checked = d.sel.has(k);
       cb.onchange = () => { cb.checked ? d.sel.add(k) : d.sel.delete(k); syncChips(d); renderChipsOnly(box, d); };
       const lab = el('label');
-      lab.append(cb, el('span', { text: bare(k) }));
+      // 与 renderCard 的列表一致：展示规范键（带 realm 前缀）。
+      lab.append(cb, el('span', { text: k }));
       if (d.manual && !(models || []).includes(k)) lab.append(el('i', { class: 'kmanual', text: '手工' }));
       mlist.append(lab);
     }

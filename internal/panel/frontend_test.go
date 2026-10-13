@@ -1006,3 +1006,57 @@ process.stdout.write(JSON.stringify({
 			strings.TrimSpace(string(out)), want)
 	}
 }
+
+// TestKeyModelListShowsCanonicalID 白名单「模型选择」列表项的显示文本必须用
+// 归一化后的 id（带 realm 前缀），不得用裸名 bare()。
+//
+// 为什么需要：默认模式后端返回 {"id":"deepseek-v4.1-flash"}（无前缀），
+// all=1 模式返回 "global:deepseek-v4.1-flash"（带前缀）。曾用 bare(k) 渲染，
+// 于是刷新页面显示裸名、点「加载所有账号模型」后又变成带前缀，同一模型两种
+// 显示，用户以为加错了（用户报的 bug）。勾选值是规范键，显示必须与之一致。
+//
+// 移植自 qiaoba223 fork 的 4eca022（TestKeyModelListShowsCanonicalID）。
+func TestKeyModelListShowsCanonicalID(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("app.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := string(src)
+
+	// 列表项必须输出规范键 k（带前缀），不能是 bare(k)。
+	// 两处渲染点：card() 的 mlist 与 renderModelsOnly()。
+	if strings.Contains(code, "el('span', { text: bare(k) })") {
+		t.Errorf("app.js 仍以 bare(k) 渲染模型列表项，应改为 k（带 realm 前缀，与勾选值一致）")
+	}
+	if !strings.Contains(code, "el('span', { text: k })") {
+		t.Errorf("app.js 未发现 el('span', { text: k }) 渲染，模型列表可能仍显示裸名")
+	}
+	// 搜索也必须基于规范键，否则搜 "global:" / "cn:" 搜不到。
+	if strings.Contains(code, "arr.filter(k => bare(k).toLowerCase().includes(f))") {
+		t.Errorf("app.js 搜索仍基于 bare(k)，应改为 k（含前缀），否则搜 global:/cn: 匹配不到")
+	}
+	if !strings.Contains(code, "arr.filter(k => k.toLowerCase().includes(f))") {
+		t.Errorf("app.js 未发现基于规范键的搜索过滤")
+	}
+}
+
+// TestKeyEditorSearchUsesLiveRealm search.oninput 重画模型列表时必须传
+// d._realm（实时值），不能传卡片构建时闭包捕获的 realm 快照。
+//
+// 为什么需要：用户点「国际」tab 后 d._realm='global'，但 realm 局部变量仍是
+// 构建时的 'cn'。旧实现传 realm，导致在搜索框输入时列表被拉回旧 realm ——
+// 表现为「在国际 tab 搜 global: 搜不到」/「切 tab 后搜索串台」（用户报的 bug）。
+func TestKeyEditorSearchUsesLiveRealm(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("app.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := string(src)
+
+	if strings.Contains(code, "renderModelsOnly(box, d, realm);") {
+		t.Errorf("search.oninput 仍传闭包捕获的 realm，应传 d._realm || 'cn'（否则切 tab 后搜索串台）")
+	}
+	if !strings.Contains(code, "renderModelsOnly(box, d, d._realm || 'cn');") {
+		t.Errorf("app.js 未发现 search.oninput 使用实时 realm（d._realm）")
+	}
+}
