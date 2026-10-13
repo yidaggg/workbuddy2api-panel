@@ -1267,6 +1267,8 @@ async function loadConfig() {
     }
     markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
     $('cfgNote').textContent = '';
+    // 受限密钥编辑器：用刚拿到的 config 直接喂，避免再发一次 GET。
+    ApiKeyEditor.load(true, cfgLoaded);
   } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
 }
 function collectConfig() {
@@ -3171,6 +3173,295 @@ if ($('btnExp')) $('btnExp').onclick = () => loadExpiry(true);
 
 // 「刷新」始终实时查（显式 force，不依赖事件对象真值）
 if ($('btnPk')) $('btnPk').onclick = () => loadPackages(true);
+
+/* ── 受限 API 密钥编辑器（config.keys[]）─────────────────────────────
+   为什么单独一个模块、而不并进 cfgForm：
+   keys[] 是数组结构，且每个元素带模型白名单；CFG_MAP 那套是"点号路径 → 标量"的
+   扁平映射，表达不了。加上白名单要拉模型列表、要按 realm 分组，逻辑不小，
+   独立成 ApiKeyEditor 更清晰。
+
+   提交方式：POST /panel/api/config 是**全量覆盖**（后端按完整对象落盘），
+   所以每次保存都必须"先 GET 完整 config → 只改 keys → 整体 POST 回去"，
+   绝不能只发 keys——否则其余配置会被抹成零值。                    */
+const ApiKeyEditor = (() => {
+  function el(tag, attrs, ...kids) {
+    const e = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs || {})) {
+      if (k === 'class') e.className = v;
+      else if (k === 'text') e.textContent = v;
+      else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+      else if (v === true) e.setAttribute(k, '');
+      else if (v !== false && v != null) e.setAttribute(k, v);
+    }
+    for (const c of kids) if (c != null) e.append(c);
+    return e;
+  }
+
+  // canonicalModelKey 与后端 server.canonicalModelKey 对齐：裸名默认归 cn 域。
+  // 白名单存的是"带 realm 前缀"的规范键（cn:xxx / global:xxx）。
+  function canon(name) {
+    const s = String(name).trim();
+    if (s.startsWith('global:')) return s;
+    if (s.startsWith('cn:')) return s;
+    return 'cn:' + s;
+  }
+  function bare(key) { return key.replace(/^(cn|global):/, ''); }
+  function realmOf(key) { return key.startsWith('global:') ? 'global' : 'cn'; }
+
+  // 编辑态草稿：{name, key, isNew, manual, allowChips:[], sel:Set}
+  // 用 Set 暂存勾选（懒同步回 allowChips），这样用户边切 realm 边勾不会丢状态。
+  function draftFromEntry(e) {
+    const chips = (e.allow || []).map(canon);
+    return { name: e.name || '', key: e.key || '', isNew: false, manual: false, allowChips: chips, sel: new Set(chips) };
+  }
+  function blankDraft() { return { name: '', key: '', isNew: true, manual: false, allowChips: [], sel: new Set() }; }
+
+  let drafts = null;   // null = 未加载
+  let models = null;   // 全量规范键集合 ['cn:xxx','global:xxx']（面板 models 端点已带前缀）
+
+  // 从后端拉全量模型（规范键，保留 cn:/global: 前缀，白名单提交的就是这个形式）。
+  // 失败时退化：只用已有白名单 + 手工添加，不阻塞编辑。
+  async function ensureModels() {
+    if (models) return models;
+    const out = new Set();
+    try {
+      const d = await api('models');
+      for (const m of (d.data || d.models || [])) {
+        const id = String(m.id || m.name || '');
+        if (!id) continue;
+        out.add(canon(id));            // 保留 realm：'global:xxx' 不被剥掉
+      }
+    } catch (e) { /* 无账号池时端点可能 503，退化为手工添加 */ }
+    models = Array.from(out).sort();
+    return models;
+  }
+
+  // 收集"当前 realm 下要显示的模型"（规范键）：目录模型 + 该 realm 已勾选/手工添加的。
+  function modelsFor(realm, draft, filter) {
+    const set = new Set(models || []);
+    for (const c of draft.allowChips) set.add(canon(c));
+    let arr = Array.from(set).filter(k => realmOf(k) === realm);
+    if (filter) {
+      const f = filter.toLowerCase();
+      arr = arr.filter(k => bare(k).toLowerCase().includes(f));
+    }
+    arr.sort();
+    // 返回规范键；渲染时用 bare() 显示、canon() 回写，避免同域名跨域歧义。
+    return arr;
+  }
+
+  function render() {
+    const host = $('apiKeyCards');
+    if (!host) return;
+    host.innerHTML = '';
+    if (!drafts || drafts.length === 0) {
+      host.append(el('div', { class: 'hint', text: '暂无受限密钥。点击右上角「添加密钥」创建。' }));
+      return;
+    }
+    const list = el('div', { class: 'keylist' });
+    drafts.forEach((d, idx) => list.append(card(d, idx)));
+    host.append(list);
+  }
+
+  function card(d, idx) {
+    const box = el('div', { class: 'keycard' });
+
+    // 第一行：名称 + 密钥
+    const r1 = el('div', { class: 'krow' });
+    const name = el('input', { type: 'text', class: 'kname', placeholder: '备注名（可选）', value: d.name });
+    name.oninput = () => { d.name = name.value; };
+    const key = el('input', { type: 'text', placeholder: '密钥字符串（如 sk-xxx）', value: d.key });
+    key.oninput = () => { d.key = key.value; };
+    r1.append(name, key, el('button', {
+      type: 'button', class: 'xs', text: '删除',
+      onclick: () => { drafts.splice(idx, 1); render(); },
+    }));
+    box.append(r1);
+
+    // 模型白名单
+    box.append(el('div', { class: 'klabel', text: '可访问模型（不勾选 = 该密钥不能访问任何模型）' }));
+
+    // 已选 chips
+    const chips = el('div', { class: 'chips' });
+    if (d.sel.size === 0) {
+      chips.append(el('span', { class: 'hint', text: '（未选择）' }));
+    } else {
+      for (const c of Array.from(d.sel).sort()) {
+        const chip = el('span', { class: 'chip' });
+        // 与 renderChipsOnly 保持一致：显示裸名，完整规范键放 title（便于区分同名跨域模型）。
+        chip.append(el('code', { text: bare(c), title: c }));
+        chip.append(el('button', {
+          type: 'button', class: 'x', text: '×', title: '移除',
+          onclick: () => { d.sel.delete(c); syncChips(d); render(); },
+        }));
+        chips.append(chip);
+      }
+    }
+    box.append(chips);
+
+    // realm 切换 + 搜索 + 复选列表
+    let realm = d._realm || 'cn';
+    const tabs = el('div', { class: 'ktabs' });
+    for (const [rk, label] of [['cn', '国内'], ['global', '国际']]) {
+      tabs.append(el('button', {
+        type: 'button', class: realm === rk ? 'on' : '', text: label,
+        onclick: () => { d._realm = rk; render(); },
+      }));
+    }
+    box.append(tabs);
+
+    let filter = d._filter || '';
+    const search = el('input', { type: 'text', class: 'ksearch', placeholder: '搜索模型…', value: filter });
+    // 只重画模型列表，不整卡重绘 —— 否则每敲一个字符搜索框都会失焦。
+    search.oninput = () => { d._filter = search.value; renderModelsOnly(box, d, realm); };
+    box.append(search);
+
+    const mlist = el('div', { class: 'kmodels' });
+    const names = modelsFor(realm, d, filter);
+    if (names.length === 0) {
+      mlist.append(el('div', { class: 'kempty', text: (models ? '该分组暂无模型（可在下方手工添加）' : '模型列表加载中…') }));
+    } else {
+      for (const k of names) {              // k 已是规范键（可能是 cn: 或 global: 前缀）
+        const cb = el('input', { type: 'checkbox' });
+        cb.checked = d.sel.has(k);
+        cb.onchange = () => { cb.checked ? d.sel.add(k) : d.sel.delete(k); syncChips(d); renderChipsOnly(box, d); };
+        const lab = el('label');
+        lab.append(cb, el('span', { text: bare(k) }));
+        if (d.manual && !(models || []).includes(k)) lab.append(el('i', { class: 'kmanual', text: '手工' }));
+        mlist.append(lab);
+      }
+    }
+    box.append(mlist);
+
+    // 手工添加模型（用于目录未列出、但上游可用的模型）
+    const add = el('div', { class: 'kaddrow' });
+    const addIn = el('input', { type: 'text', placeholder: '手工添加模型名（回车）' });
+    const doAdd = () => {
+      const v = addIn.value.trim();
+      if (!v) return;
+      d.sel.add(canon(realm + ':' + bare(v)));
+      d.allowChips = Array.from(d.sel);
+      addIn.value = '';
+      render();
+    };
+    addIn.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); doAdd(); } };
+    add.append(addIn, el('button', { type: 'button', class: 'xs', text: '添加', onclick: doAdd }));
+    box.append(add);
+
+    return box;
+  }
+
+  // syncChips：把勾选集合回写 allowChips（保存时用）
+  function syncChips(d) { d.allowChips = Array.from(d.sel); }
+
+  // renderChipsOnly：只重画 chips 区（勾选时避免整卡重绘导致搜索框失焦）
+  function renderChipsOnly(box, d) {
+    const chips = box.querySelector('.chips');
+    if (!chips) return;
+    chips.innerHTML = '';
+    if (d.sel.size === 0) { chips.append(el('span', { class: 'hint', text: '（未选择）' })); return; }
+    for (const c of Array.from(d.sel).sort()) {
+      const chip = el('span', { class: 'chip' });
+      // 显示裸名（用户不关心前缀），完整规范键放 title，便于区分同名跨域模型。
+      chip.append(el('code', { text: bare(c), title: c }));
+      chip.append(el('button', { type: 'button', class: 'x', text: '×', onclick: () => {
+        d.sel.delete(c); syncChips(d);
+        // 只重画 chip 区 + 模型列表，避免整卡重绘丢失搜索词/焦点
+        renderChipsOnly(box, d);
+        renderModelsOnly(box, d, d._realm || 'cn');
+      } }));
+      chips.append(chip);
+    }
+  }
+
+  // renderModelsOnly：只重画模型列表区（搜索输入时避免整卡重绘导致输入框失焦）
+  function renderModelsOnly(box, d, realm) {
+    const mlist = box.querySelector('.kmodels');
+    if (!mlist) return;
+    mlist.innerHTML = '';
+    const names = modelsFor(realm, d, d._filter || '');
+    if (names.length === 0) {
+      mlist.append(el('div', { class: 'kempty', text: (models ? '该分组暂无模型（可在下方手工添加）' : '模型列表加载中…') }));
+      return;
+    }
+    for (const k of names) {
+      const cb = el('input', { type: 'checkbox' });
+      cb.checked = d.sel.has(k);
+      cb.onchange = () => { cb.checked ? d.sel.add(k) : d.sel.delete(k); syncChips(d); renderChipsOnly(box, d); };
+      const lab = el('label');
+      lab.append(cb, el('span', { text: bare(k) }));
+      if (d.manual && !(models || []).includes(k)) lab.append(el('i', { class: 'kmanual', text: '手工' }));
+      mlist.append(lab);
+    }
+  }
+
+  async function load(force, cfgObj) {
+    if (drafts && !force) { render(); return; }
+    try {
+      let cfg = cfgObj;
+      if (!cfg) {
+        const d = await api('config');
+        cfg = d.config || {};
+      }
+      const keys = cfg.keys || [];
+      drafts = keys.map(draftFromEntry);
+      await ensureModels();
+      render();
+    } catch (e) { toast('读取密钥失败：' + e.message, 'err'); }
+  }
+
+  async function save() {
+    // 保存前重新拉完整 config：避免用到过期的缓存对象而被全量覆盖抹掉其他字段。
+    let full;
+    try {
+      const d = await api('config');
+      full = d.config || {};
+    } catch (e) { toast('读取配置失败：' + e.message, 'err'); return; }
+
+    const out = [];
+    for (const d of drafts) {
+      const key = (d.key || '').trim();
+      if (!key) { toast('存在密钥为空的条目，请填写或删除', 'err'); return; }
+      syncChips(d);
+      out.push({ key, name: (d.name || '').trim() || undefined, allow: Array.from(d.sel).sort() });
+    }
+    full.keys = out; // 只改 keys，其余字段原样带回
+
+    try {
+      const r = await api('config', { method: 'POST', body: JSON.stringify(full) });
+      const rr = r.restart_required || [];
+      toast(rr.length ? ('已保存（' + rr.length + ' 项需重启生效）') : '密钥已保存并热生效', 'ok');
+      await load(true);
+    } catch (e) { toast('保存失败：' + e.message, 'err'); }
+  }
+
+  function bind() {
+    if ($('btnKeyAdd')) $('btnKeyAdd').onclick = () => {
+      if (!drafts) { toast('配置尚未加载完成', 'err'); return; }
+      drafts.push(blankDraft());
+      render();
+    };
+    if ($('btnKeyLoadAll')) $('btnKeyLoadAll').onclick = async () => {
+      if (!drafts) return;
+      await ensureModels();
+      // 「载入全部」= 让所有密钥可访问目录里所有模型（cn + global）。
+      // 破坏性：它会覆盖各密钥已有的白名单，加确认。
+      if (!confirm('将把所有密钥设为「可访问全部模型」，覆盖各自现有的白名单。继续？')) return;
+      for (const d of drafts) {
+        d.sel = new Set(models || []);   // models 已是规范键，直接全量装入
+        syncChips(d);
+      }
+      render();
+      toast('已为所有密钥勾选全部模型（记得点保存）', 'ok');
+    };
+  }
+
+  return { load, save, bind, render };
+})();
+
+// 密钥编辑器按钮绑定 + 保存按钮（在模块外绑定，避免模块内部依赖 DOM 顺序）
+if ($('btnKeySave')) $('btnKeySave').onclick = () => ApiKeyEditor.save();
+ApiKeyEditor.bind();
 
 /* ── 启动 ───────────────────────────────────────────────────────────
    顺序至关重要：**先**过登录门（gate 决定用 Cookie 会话还是 api_key），

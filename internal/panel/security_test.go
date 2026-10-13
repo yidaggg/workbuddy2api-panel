@@ -144,3 +144,62 @@ func TestAuthLayerBehavior(t *testing.T) {
 		t.Error("valid key must pass the auth layer")
 	}
 }
+
+// 内嵌静态资源必须带 ETag + no-cache，且支持条件请求 304：
+// 否则浏览器启发式缓存会在升级二进制后继续复用旧 app.js（真踩过：
+// 前端改了却看不到效果，得硬刷新），on-call 排查代价很高。
+func TestEmbeddedAssetsCacheable(t *testing.T) {
+	p := newTestPanel()
+	for _, path := range []string{"/panel/", "/panel/app.js"} {
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: code=%d want 200", path, rec.Code)
+		}
+		if cc := rec.Header().Get("Cache-Control"); cc != "no-cache" {
+			t.Errorf("%s: Cache-Control=%q want %q", path, cc, "no-cache")
+		}
+		etag := rec.Header().Get("ETag")
+		if etag == "" {
+			t.Fatalf("%s: missing ETag", path)
+		}
+
+		// 带同一 ETag 再来一次：必须 304 且无响应体（省掉整份资源重传）。
+		req := httptest.NewRequest("GET", path, nil)
+		req.Header.Set("If-None-Match", etag)
+		rec2 := httptest.NewRecorder()
+		p.ServeHTTP(rec2, req)
+		if rec2.Code != http.StatusNotModified {
+			t.Errorf("%s: conditional GET code=%d want 304", path, rec2.Code)
+		}
+		if rec2.Body.Len() != 0 {
+			t.Errorf("%s: 304 must have empty body, got %d bytes", path, rec2.Body.Len())
+		}
+
+		// 过期 ETag 必须回 200 全量（否则升级后永远拿不到新版）。
+		req = httptest.NewRequest("GET", path, nil)
+		req.Header.Set("If-None-Match", `"stale-etag-from-old-binary"`)
+		rec3 := httptest.NewRecorder()
+		p.ServeHTTP(rec3, req)
+		if rec3.Code != http.StatusOK {
+			t.Errorf("%s: mismatched ETag code=%d want 200", path, rec3.Code)
+		}
+		if rec3.Body.Len() == 0 {
+			t.Errorf("%s: mismatched ETag must resend full body", path)
+		}
+	}
+}
+
+// ETag 必须由内容决定（内容不同 => ETag 不同），否则校验形同虚设。
+func TestETagDerivedFromContent(t *testing.T) {
+	if etagOf([]byte("a")) == etagOf([]byte("b")) {
+		t.Error("etagOf must vary with content")
+	}
+	if etagOf([]byte("same")) != etagOf([]byte("same")) {
+		t.Error("etagOf must be deterministic")
+	}
+	if !strings.HasPrefix(etagOf(appJS), `"`) || !strings.HasSuffix(etagOf(appJS), `"`) {
+		t.Error("etagOf must return a quoted ETag")
+	}
+}

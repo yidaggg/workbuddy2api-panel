@@ -9,8 +9,12 @@
 package panel
 
 import (
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"net/http"
+	"strconv"
+	"strings"
 )
 
 //go:embed index.html
@@ -18,6 +22,45 @@ var indexHTML []byte
 
 //go:embed app.js
 var appJS []byte
+
+// 资源内容指纹（ETag）。字体固定为强校验（不弱化），供浏览器条件请求复用。
+// 为什么需要：这两个资源是 go:embed 进二进制的，服务端此前不发任何缓存指令，
+// 浏览器会走启发式缓存，升级二进制后仍复用旧的 app.js —— 表现为「改了前端却不生效」，
+// 必须硬刷新才可见（真实踩到过）。发 no-cache + ETag 后：每次都会带 If-None-Match
+// 回源校验，未变则 304（不重传 146KB），变了立即拿新版，升级即时生效。
+var (
+	indexETag = etagOf(indexHTML)
+	appETag   = etagOf(appJS)
+)
+
+// etagOf 返回资源内容的 sha256 指纹（带引号的强 ETag）。
+func etagOf(b []byte) string {
+	sum := sha256.Sum256(b)
+	return `"` + hex.EncodeToString(sum[:16]) + `"`
+}
+
+// serveEmbedded 输出内嵌静态资源，带 ETag 条件请求支持。
+// Cache-Control 用 no-cache（不是 no-store）：允许缓存副本，但每次使用前必须回源校验，
+// 因此既不会用到过期版本，也不会重复传输未变更的大文件。
+func serveEmbedded(w http.ResponseWriter, r *http.Request, body []byte, etag, ctype string) {
+	setSecurityHeaders(w)
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Content-Type", ctype)
+
+	// If-None-Match 可能带多个值/弱前缀，逐个比对。
+	for _, cand := range strings.Split(r.Header.Get("If-None-Match"), ",") {
+		if strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(cand), "W/")) == etag {
+			w.Header().Set("Content-Length", "0")
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
+
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
 
 // csp 内容安全策略（严格版，无需 unsafe-inline）：
 //   - default-src 'none'        默认全禁，逐个开口
@@ -46,16 +89,10 @@ func setSecurityHeaders(w http.ResponseWriter) {
 
 // index 输出面板页面（静态无秘密；数据接口 /panel/api/* 才走鉴权）。
 func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(indexHTML)
+	serveEmbedded(w, r, indexHTML, indexETag, "text/html; charset=utf-8")
 }
 
 // appScript 输出前端逻辑（同源脚本，供 CSP script-src 'self' 加载）。
 func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(appJS)
+	serveEmbedded(w, r, appJS, appETag, "text/javascript; charset=utf-8")
 }

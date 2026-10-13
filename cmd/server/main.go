@@ -14,6 +14,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -460,6 +462,10 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	if err := json.Unmarshal(oldRaw, &cur); err != nil {
 		cur = map[string]any{}
 	}
+	// 快照改动前的配置：mergeConfigMaps 是**原地**修改 cur 并把它作为返回值，
+	// 因此 merged 与 cur 是同一个 map。若不留快照，下面比对 old/new 时两边
+	// 指向同一份已被覆盖的数据，任何改动都会被判成"没变"，重启提示全部消失。
+	oldSnapshot := deepCopyMap(cur)
 	if err := json.Unmarshal(raw, &incoming); err != nil {
 		return nil, fmt.Errorf("parse submitted config: %w", err)
 	}
@@ -538,35 +544,175 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 
-	return restartRequiredFields(newCfg), nil
+	return restartRequiredFields(oldSnapshot, merged), nil
 }
 
-// restartRequiredFields 返回本次改动中无法热生效、需要重启进程的字段名。
-// 恒返回完整清单中的"与当前进程装配期依赖相关"的项——面板据此提示用户。
-func restartRequiredFields(c *Config) []string {
+// deepCopyMap 递归复制配置 map，用于在原地合并前留下"改动前"的快照。
+// 只处理 JSON 解码产物的类型（map[string]any / []any / 标量）。
+func deepCopyMap(m map[string]any) map[string]any {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = deepCopyValue(v)
+	}
+	return out
+}
+
+func deepCopyValue(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		return deepCopyMap(t)
+	case []any:
+		cp := make([]any, len(t))
+		for i, e := range t {
+			cp[i] = deepCopyValue(e)
+		}
+		return cp
+	default:
+		return v // 标量（string/float64/bool/nil）不可变，直接复用
+	}
+}
+
+// restartRequiredFields 返回本次改动中「确实变了」且无法热生效、需要重启进程的字段名。
+//
+// 早期实现只接收 newCfg，把一份静态清单无条件全量返回（"恒返回完整清单"），
+// 结果只改一个密钥也会被告知 13 个字段需要重启（listen / auth_dir / 各种 timeout
+// 全被点名）。用户只动 keys 却看到"需重启 13 项"，久而久之就会无视这条提示，
+// 于是真正需要重启的改动（比如改 listen）也被一起忽略——警示反而失效。
+//
+// 现在按 old/new 两份原始 map 逐字段比对，只列出真正发生变化的项。
+// 比较用「归一化后的语义值」而非原始 JSON 文本：面板回填会把 30m 写成 "30m"、
+// 把数组写成逗号串，文本可能变而语义未变，按文本比较会误报。
+func restartRequiredFields(old, cur map[string]any) []string {
 	var out []string
+	// add 只在给定字段中至少一个的语义值变化时，把它们全部计入。
+	// 用「语义值」而非原始 JSON 文本比较：面板回填可能改变书写形式
+	// （30m 与 "30m"、数组顺序重排、2 与 2.0），文本变而语义未变不该误报。
+	add := func(keys ...string) {
+		for _, k := range keys {
+			if !semanticEqual(deepGet(old, k), deepGet(cur, k)) {
+				out = append(out, k)
+			}
+		}
+	}
 	// 这些字段在进程内被监听地址/HTTP client/目录句柄等装配期对象捕获。
-	if c.Listen != "" {
-		out = append(out, "listen")
-	}
-	if c.AuthDir != "" {
-		out = append(out, "auth_dir")
-	}
-	if c.StateFile != "" {
-		out = append(out, "state_file")
-	}
-	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds")
+	add("listen")
+	add("auth_dir")
+	add("state_file")
 	// upstream.user_agent 在装配期被写进出站 client（main.go 的 up.UserAgent = ...），
 	// 之后不再读取——不在 livecfg 热快照里，也无法热改。此前漏列，导致面板改完
 	// 显示"已保存"却不提示需要重启，用户以为没生效（issue #102 附带发现 2）。
-	out = append(out, "upstream.user_agent")
-	if c.Upstash.URL != "" || c.Upstash.Token != "" {
-		out = append(out, "upstash")
-	}
-	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
-	out = append(out, "logging.request_archive_enabled", "logging.request_retention_days", "logging.request_archive_max_mb")
-	out = append(out, "server.read_timeout")
+	add("upstream.timeout_seconds", "upstream.header_timeout_seconds",
+		"upstream.idle_timeout_seconds", "upstream.user_agent")
+	add("upstash.url", "upstash.token")
+	add("session_sticky.ttl", "session_sticky.gc_interval")
+	add("logging.request_archive_enabled", "logging.request_retention_days",
+		"logging.request_archive_max_mb")
+	add("server.read_timeout")
 	return out
+}
+
+// deepGet 取 dotted path 的值（如 "upstream.timeout_seconds"）；任一层缺失返回 nil。
+func deepGet(m map[string]any, path string) any {
+	var cur any = m
+	for _, seg := range strings.Split(path, ".") {
+		mm, ok := cur.(map[string]any)
+		if !ok {
+			return nil
+		}
+		v, ok := mm[seg]
+		if !ok {
+			return nil
+		}
+		cur = v
+	}
+	return cur
+}
+
+// semanticEqual 判断两个配置值语义上是否相同（而非文本相同）：
+//   - nil / 缺失 与零值（""、0、false、空数组）视为等价，避免面板回填空串被误报为改动
+//   - 数字统一按 float64 比较（JSON 解析产物），2 与 2.0 相同
+//   - 数组忽略顺序差异（面板把集合写成逗号串，顺序可能重排）
+//   - 其余走 json.Marshal 的规范化比较
+func semanticEqual(a, b any) bool {
+	if isZeroish(a) && isZeroish(b) {
+		return true
+	}
+	af, aok := toFloat(a)
+	bf, bok := toFloat(b)
+	if aok && bok {
+		return af == bf
+	}
+	as, aok := a.([]any)
+	bs, bok := b.([]any)
+	if aok && bok {
+		return sameStringSet(as, bs)
+	}
+	ja, ea := json.Marshal(a)
+	jb, eb := json.Marshal(b)
+	if ea != nil || eb != nil {
+		return false
+	}
+	return string(ja) == string(jb)
+}
+
+// isZeroish 报告值是否为"未设置"语义：nil、空串、0、false、空数组/空对象。
+func isZeroish(v any) bool {
+	switch t := v.(type) {
+	case nil:
+		return true
+	case string:
+		return t == ""
+	case bool:
+		return !t
+	case float64:
+		return t == 0
+	case []any:
+		return len(t) == 0
+	case map[string]any:
+		return len(t) == 0
+	}
+	return false
+}
+
+// toFloat 把 JSON 数字（float64）或数字字符串转为 float64。
+func toFloat(v any) (float64, bool) {
+	switch t := v.(type) {
+	case float64:
+		return t, true
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(t), 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	}
+	return 0, false
+}
+
+// sameStringSet 比较两个数组是否元素集合相同（忽略顺序与标量类型差异，
+// 数字统一按格式化后的文本比对，使 2 与 "2" 视为同一元素）。
+func sameStringSet(a, b []any) bool {
+	norm := func(xs []any) map[string]int {
+		m := map[string]int{}
+		for _, v := range xs {
+			key := fmt.Sprintf("%v", v)
+			if f, ok := toFloat(v); ok {
+				key = strconv.FormatFloat(f, 'f', -1, 64)
+			}
+			m[key]++
+		}
+		return m
+	}
+	ma, mb := norm(a), norm(b)
+	if len(ma) != len(mb) {
+		return false
+	}
+	for k, n := range ma {
+		if mb[k] != n {
+			return false
+		}
+	}
+	return true
 }
 
 // mergeConfigMaps 把 incoming 深合并进 cur（原地），返回 cur。

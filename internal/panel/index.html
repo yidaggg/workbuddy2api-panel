@@ -326,6 +326,40 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 /* 伪密码框：用 type="text" 避开浏览器自动填充（详见登录框处的长注释），
    靠 -webkit-text-security 显示为圆点。 */
 input.secret { -webkit-text-security: disc; text-security: disc; }
+
+/* ── 白名单密钥编辑器 ────────────────────────────────────────────────
+   结构：.keycard 一张密钥卡，内含 名称/密钥/模型选择。
+   .ktabs 是"国内/国际"切换；.kmodels 是可滚动复选列表（带搜索）。
+   手机上要点：卡片内边距够大、按钮 ≥32px 好点按、模型列表独立滚动不撑高页面。 */
+.keylist { display: flex; flex-direction: column; gap: 12px; }
+.keycard {
+  border: 1px solid var(--line-soft); border-radius: 10px;
+  padding: 12px; background: var(--surface-2);
+}
+.keycard .krow { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+.keycard .krow input[type=text] { flex: 1 1 160px; min-width: 0; }
+.keycard .kname { flex: 0 1 150px; }
+.keycard .klabel { font-size: 12px; opacity: .7; margin: 8px 0 4px; }
+.ktabs { display: flex; gap: 6px; margin-bottom: 6px; }
+.ktabs button {
+  flex: 0 0 auto; font-size: 12px; padding: 4px 12px; border-radius: 999px;
+  border: 1px solid var(--line-soft); background: transparent; color: inherit;
+}
+.ktabs button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+.ksearch { width: 100%; margin-bottom: 6px; }
+.kmodels {
+  max-height: 190px; overflow-y: auto;
+  border: 1px solid var(--line-soft); border-radius: 8px; padding: 6px 8px;
+}
+.kmodels label { display: flex; align-items: center; gap: 8px; padding: 4px 2px; font-size: 13px; }
+.kmodels label input { flex: 0 0 auto; }
+.kmodels .kempty { font-size: 12px; opacity: .6; padding: 8px 2px; }
+.kaddrow { display: flex; gap: 6px; margin-top: 6px; }
+.kaddrow input[type=text] { flex: 1 1 auto; min-width: 0; font-size: 13px; }
+.kaddrow button { flex: 0 0 auto; }
+.kmanual { font-style: normal; font-size: 10px; opacity: .6; border: 1px solid currentColor; border-radius: 4px; padding: 0 4px; margin-left: 4px; }
+.kwarn { margin: 6px 0; padding: 6px 10px; font-size: 12px; border-radius: 6px; background: rgba(220,53,69,.12); border: 1px solid rgba(220,53,69,.45); color: #e66; }
+.kbtns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; }
 /* 登录/密钥门是"全屏独占"：不透明背景 + 更高的 z-index。
    半透明的普通弹窗（.veil）叠在面板之上没问题，但登录门之下**不能有任何东西**——
    面板骨架在未登录时已 hidden，这里再把背景做成不透明，双保险确保
@@ -924,6 +958,28 @@ input.secret { -webkit-text-security: disc; text-security: disc; }
             <label class="fld"><span class="lb">单账号明细默认展示条数</span>
               <input name="package_detail_limit" type="number" min="1" placeholder="5">
               <span class="hint">积分构成页按最早到期展示，其余未用完包聚合</span></label>
+          </div>
+        </div>
+
+        <!-- 受限 API 密钥（多密钥 + 模型白名单）：独立于主密钥，
+             config.json 的 keys[]。不经 cfgForm 提交——它带数组结构，
+             和扁平 CFG_MAP 不是一路；由 ApiKeyEditor 模块单独读写 config。 -->
+        <div class="box" id="apiKeysBox">
+          <header>
+            <h3>受限 API 密钥</h3>
+            <span class="grow"></span>
+            <button type="button" class="xs" id="btnKeyLoadAll">加载全部模型</button>
+            <button type="button" class="xs" id="btnKeyAdd">添加密钥</button>
+          </header>
+          <div class="pad">
+            <p class="hint" style="margin:0 0 10px">
+              主密钥（上方「API 密钥」）不受限、可访问全部模型。<b>这里的每个密钥只能访问各自白名单里的模型</b>，
+              适合分发给不同用途的客户端。
+            </p>
+            <div id="apiKeyCards"></div>
+            <div class="kbtns">
+              <button type="button" class="primary" id="btnKeySave">保存密钥</button>
+            </div>
           </div>
         </div>
 
