@@ -254,7 +254,7 @@ mkdir -p auths data && cp config.example.json config.json
 docker run -d --name workbuddy2api \
   -p 7863:7863 -e TZ=Asia/Shanghai \
   -v ./auths:/app/auths -v ./data:/app/data -v ./config.json:/app/config.json \
-  ghcr.io/linguo2625469/workbuddy2api-panel:latest
+  ghcr.io/yidaggg/workbuddy2api-panel:latest
 
 # 3. 健康检查（无可用账号时返回 503）
 curl -s http://localhost:7863/healthz
@@ -270,7 +270,7 @@ curl -s http://localhost:7863/healthz
 
 ```bash
 # 1. 克隆
-git clone https://github.com/linguo2625469/workbuddy2api-panel.git
+git clone https://github.com/yidaggg/workbuddy2api-panel.git
 cd workbuddy2api-panel
 
 # 2. 准备配置（compose 挂载此文件，缺失会导致容器启动失败）
@@ -284,6 +284,12 @@ docker compose up -d --build
 curl -s http://localhost:7863/healthz
 # {"healthy":0,"total":0,"service":"workbuddy2api"}
 ```
+
+> **国内构建加速**：Dockerfile 默认启用国内镜像（Go proxy 走 `goproxy.cn`、apk 源走阿里云），
+> 以规避国内直连 `proxy.golang.org` / `dl-cdn.alpinelinux.org` 超时。**国外或自建镜像源环境**
+> 构建时在 `.env` 里写 `CN_MIRROR=0`，或临时用 `CN_MIRROR=0 docker compose build`，改走官方源。
+> （docker-compose 已将该变量透传给 Dockerfile 的 `build.args`；直接 `docker build` 时用
+> `--build-arg CN_MIRROR=0`。）
 
 启动后打开 **`http://localhost:7863/panel/`**，用面板「添加账号」完成登录（见下节）。
 

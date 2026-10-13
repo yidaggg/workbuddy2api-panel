@@ -1,6 +1,11 @@
 services:
   wb2api:
-    build: .
+    build:
+      context: .
+      # 国内构建加速开关（默认 1=启用国内镜像）。国外/自建源环境可在 .env 写 CN_MIRROR=0，
+      # 或在命令行 `CN_MIRROR=0 docker compose build` 覆盖。
+      args:
+        CN_MIRROR: "${CN_MIRROR:-1}"
     container_name: workbuddy2api
     restart: unless-stopped
     # 容器默认以 app 用户（uid 10001）运行。宿主机挂载目录属主不同会导致
